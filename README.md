@@ -439,6 +439,10 @@ The exact payloads are consumed internally by the MultiBot addon.
     <td>Run whitelist-only disperse distance and disable commands.</td>
   </tr>
   <tr>
+    <td><code>RUN~FORMATION</code></td>
+    <td>Set the bot formation (melee, queue, chaos, default, circle, line, shield, arrow, near, far) natively, with no chat reply.</td>
+  </tr>
+  <tr>
     <td><code>RUN~LOOT</code></td>
     <td>Run whitelist-only loot rules and loot list commands without addon-side chat parsing.</td>
   </tr>
