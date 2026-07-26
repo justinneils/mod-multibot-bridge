@@ -101,12 +101,25 @@ bool TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& p
     if (payload.empty())
         return false;
 
-    if (payload.rfind(kAddonPrefix, 0) == 0)
-    {
-        payload.erase(0, std::char_traits<char>::length(kAddonPrefix));
-        while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
-            payload.erase(payload.begin());
-    }
+    // The MBOT prefix identifies bridge traffic and is REQUIRED, not optional.
+    // Previously the prefix was merely stripped when present and the function
+    // still returned true otherwise, so every addon message on the realm --
+    // from any addon -- was claimed as bridge traffic, parsed, and logged as
+    // "MultiBotBridge RX". It also meant a foreign addon whose first
+    // field happened to uppercase to a bridge opcode (GET / HELLO / PING /
+    // RUN) had that opcode executed on its behalf.
+    std::size_t const prefixLength = std::char_traits<char>::length(kAddonPrefix);
+    if (payload.rfind(kAddonPrefix, 0) != 0)
+        return false;
+
+    // Require a separator (or end of message) after the prefix, so a different
+    // addon whose prefix merely starts with "MBOT" is not mistaken for ours.
+    if (payload.length() > prefixLength && payload[prefixLength] != '	' && payload[prefixLength] != ' ')
+        return false;
+
+    payload.erase(0, prefixLength);
+    while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
+        payload.erase(payload.begin());
 
     return !payload.empty();
 }
