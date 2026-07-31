@@ -18,6 +18,10 @@
 #include "RandomPlayerbotMgr.h"
 #include "ReputationMgr.h"
 #include "AiObjectContext.h"
+#include "Formations.h"
+#include "GameGraveyard.h"
+#include "MapMgr.h"
+#include "MotionMaster.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
@@ -101,12 +105,25 @@ bool TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& p
     if (payload.empty())
         return false;
 
-    if (payload.rfind(kAddonPrefix, 0) == 0)
-    {
-        payload.erase(0, std::char_traits<char>::length(kAddonPrefix));
-        while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
-            payload.erase(payload.begin());
-    }
+    // The MBOT prefix identifies bridge traffic and is REQUIRED, not optional.
+    // Previously the prefix was merely stripped when present and the function
+    // still returned true otherwise, so every addon message on the realm --
+    // from any addon -- was claimed as bridge traffic, parsed, and logged as
+    // "MultiBotBridge RX". It also meant a foreign addon whose first
+    // field happened to uppercase to a bridge opcode (GET / HELLO / PING /
+    // RUN) had that opcode executed on its behalf.
+    std::size_t const prefixLength = std::char_traits<char>::length(kAddonPrefix);
+    if (payload.rfind(kAddonPrefix, 0) != 0)
+        return false;
+
+    // Require a separator (or end of message) after the prefix, so a different
+    // addon whose prefix merely starts with "MBOT" is not mistaken for ours.
+    if (payload.length() > prefixLength && payload[prefixLength] != '	' && payload[prefixLength] != ' ')
+        return false;
+
+    payload.erase(0, prefixLength);
+    while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
+        payload.erase(payload.begin());
 
     return !payload.empty();
 }
@@ -3521,6 +3538,68 @@ bool ApplyNativeDisperseCommand(Player* bot, std::string const& command)
     return true;
 }
 
+// Formation names accepted by mod-playerbots (FormationValue::Load, Formations.cpp).
+// "default" is its documented alias for "chaos". Validating here rather than letting
+// Load() reject it means the ACK can report executed=0 instead of a silent no-op.
+bool IsAllowedFormationCommand(std::string const& command)
+{
+    static std::set<std::string> const allowed =
+    {
+        "formation melee",
+        "formation queue",
+        "formation chaos",
+        "formation default",
+        "formation circle",
+        "formation line",
+        "formation shield",
+        "formation arrow",
+        "formation near",
+        "formation far"
+    };
+
+    return allowed.find(command) != allowed.end();
+}
+
+std::string NormalizeFormationCommand(std::string const& command)
+{
+    std::string normalized = Trim(command);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c)
+    {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    return normalized;
+}
+
+// Applied natively rather than by dispatching the "formation <name>" chat command.
+// SetFormationAction::Execute always answers with TellMaster("Formation set to: x"),
+// which would whisper the requester once per bot -- the exact chat traffic the bridge
+// exists to avoid. Load() performs the same swap without the reply.
+bool ApplyNativeFormationCommand(Player* bot, std::string const& command)
+{
+    if (!bot)
+        return false;
+
+    PlayerbotAI* const ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!ai || !ai->GetAiObjectContext())
+        return false;
+
+    std::string const prefix = "formation ";
+    if (command.rfind(prefix, 0) != 0)
+        return false;
+
+    std::string const formationName = Trim(command.substr(prefix.size()));
+    if (formationName.empty())
+        return false;
+
+    AiObjectContext* const context = ai->GetAiObjectContext();
+    auto* const formation = static_cast<FormationValue*>(context->GetValue<Formation*>("formation"));
+    if (!formation)
+        return false;
+
+    return formation->Load(formationName);
+}
+
 bool IsAllowedCombatCommand(std::string const& command)
 {
     std::string const normalized = ToUpper(Trim(command));
@@ -3787,6 +3866,102 @@ void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const&
         << kFieldSeparator << UrlEncodeField(command);
 
     SendAddonPacket(requester, replyType, "POSITION_ACK", payload.str());
+}
+
+void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const command = NormalizeFormationCommand(rawCommand);
+    uint32 executed = 0;
+
+    if (IsAllowedFormationCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    {
+        for (Player* const bot : GetBridgeVisibleBots(requester))
+        {
+            if (!BotMatchesCombatScope(requester, bot, scope, target))
+                continue;
+
+            if (ApplyNativeFormationCommand(bot, command))
+                ++executed;
+        }
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << executed
+        << kFieldSeparator << UrlEncodeField(command);
+
+    SendAddonPacket(requester, replyType, "FORMATION_ACK", payload.str());
+}
+
+// Necro-Network graveyard hop. This deliberately does NOT dispatch ".go graveyard":
+// that command is gated behind RBAC_PERM_COMMAND_GO, which also carries ".go xyz" and
+// so would hand every account teleport-to-arbitrary-coordinates. Resolving the id here
+// confines the capability to the graveyard list and nothing else.
+//
+// Returns an error token rather than a bool so the addon can say why it refused.
+std::string ApplyGraveyardTeleport(Player* player, uint32 graveyardId)
+{
+    if (!player)
+        return "NO_PLAYER";
+
+    // Guards the GM command does not need, because a GM is trusted and a player is
+    // not. Without the combat check this becomes a free combat-escape button.
+    if (player->IsInCombat())
+        return "IN_COMBAT";
+
+    if (player->InBattleground() || player->InArena())
+        return "IN_BATTLEGROUND";
+
+    GraveyardStruct const* graveyard = sGraveyard->GetGraveyard(graveyardId);
+    if (!graveyard)
+        return "NO_SUCH_GRAVEYARD";
+
+    if (!MapMgr::IsValidMapCoord(graveyard->Map, graveyard->x, graveyard->y, graveyard->z))
+        return "BAD_COORDS";
+
+    // Mirrors HandleGoGraveyardCommand: a teleport out of a taxi flight has to
+    // terminate the flight first, and the recall point is only meaningful when the
+    // player was not already airborne.
+    if (player->IsInFlight())
+    {
+        player->GetMotionMaster()->MovementExpired();
+        player->CleanupAfterTaxiFlight();
+    }
+    else
+        player->SaveRecallPosition();
+
+    player->TeleportTo(graveyard->Map, graveyard->x, graveyard->y, graveyard->z, player->GetOrientation());
+
+    return "OK";
+}
+
+void RunGraveyardCommand(Player* requester, ChatMsg replyType, std::string const& graveyardValue, std::string const& requestToken)
+{
+    std::string const token = Trim(requestToken);
+    std::string const idText = Trim(UrlDecodeField(graveyardValue));
+
+    uint32 graveyardId = 0;
+    std::string result = "BAD_REQUEST";
+
+    if (!idText.empty() && idText.find_first_not_of("0123456789") == std::string::npos)
+    {
+        graveyardId = static_cast<uint32>(std::strtoul(idText.c_str(), nullptr, 10));
+        if (graveyardId)
+            result = ApplyGraveyardTeleport(requester, graveyardId);
+    }
+
+    std::ostringstream payload;
+    payload << graveyardId
+        << kFieldSeparator << token
+        << kFieldSeparator << result;
+
+    SendAddonPacket(requester, replyType, "GRAVEYARD_ACK", payload.str());
 }
 
 void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
@@ -4365,6 +4540,24 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
 
             RunPositionCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
+            return true;
+        }
+
+        if (requestType == "GRAVEYARD")
+        {
+            std::pair<std::string, std::string> const idSplit = SplitOnce(request.second, kFieldSeparator);
+
+            RunGraveyardCommand(player, replyType, idSplit.first, idSplit.second);
+            return true;
+        }
+
+        if (requestType == "FORMATION")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunFormationCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
