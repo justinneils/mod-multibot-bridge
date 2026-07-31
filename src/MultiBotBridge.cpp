@@ -19,6 +19,9 @@
 #include "ReputationMgr.h"
 #include "AiObjectContext.h"
 #include "Formations.h"
+#include "GameGraveyard.h"
+#include "MapMgr.h"
+#include "MotionMaster.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
@@ -3896,6 +3899,71 @@ void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const
     SendAddonPacket(requester, replyType, "FORMATION_ACK", payload.str());
 }
 
+// Necro-Network graveyard hop. This deliberately does NOT dispatch ".go graveyard":
+// that command is gated behind RBAC_PERM_COMMAND_GO, which also carries ".go xyz" and
+// so would hand every account teleport-to-arbitrary-coordinates. Resolving the id here
+// confines the capability to the graveyard list and nothing else.
+//
+// Returns an error token rather than a bool so the addon can say why it refused.
+std::string ApplyGraveyardTeleport(Player* player, uint32 graveyardId)
+{
+    if (!player)
+        return "NO_PLAYER";
+
+    // Guards the GM command does not need, because a GM is trusted and a player is
+    // not. Without the combat check this becomes a free combat-escape button.
+    if (player->IsInCombat())
+        return "IN_COMBAT";
+
+    if (player->InBattleground() || player->InArena())
+        return "IN_BATTLEGROUND";
+
+    GraveyardStruct const* graveyard = sGraveyard->GetGraveyard(graveyardId);
+    if (!graveyard)
+        return "NO_SUCH_GRAVEYARD";
+
+    if (!MapMgr::IsValidMapCoord(graveyard->Map, graveyard->x, graveyard->y, graveyard->z))
+        return "BAD_COORDS";
+
+    // Mirrors HandleGoGraveyardCommand: a teleport out of a taxi flight has to
+    // terminate the flight first, and the recall point is only meaningful when the
+    // player was not already airborne.
+    if (player->IsInFlight())
+    {
+        player->GetMotionMaster()->MovementExpired();
+        player->CleanupAfterTaxiFlight();
+    }
+    else
+        player->SaveRecallPosition();
+
+    player->TeleportTo(graveyard->Map, graveyard->x, graveyard->y, graveyard->z, player->GetOrientation());
+
+    return "OK";
+}
+
+void RunGraveyardCommand(Player* requester, ChatMsg replyType, std::string const& graveyardValue, std::string const& requestToken)
+{
+    std::string const token = Trim(requestToken);
+    std::string const idText = Trim(UrlDecodeField(graveyardValue));
+
+    uint32 graveyardId = 0;
+    std::string result = "BAD_REQUEST";
+
+    if (!idText.empty() && idText.find_first_not_of("0123456789") == std::string::npos)
+    {
+        graveyardId = static_cast<uint32>(std::strtoul(idText.c_str(), nullptr, 10));
+        if (graveyardId)
+            result = ApplyGraveyardTeleport(requester, graveyardId);
+    }
+
+    std::ostringstream payload;
+    payload << graveyardId
+        << kFieldSeparator << token
+        << kFieldSeparator << result;
+
+    SendAddonPacket(requester, replyType, "GRAVEYARD_ACK", payload.str());
+}
+
 void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
@@ -4472,6 +4540,14 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
 
             RunPositionCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
+            return true;
+        }
+
+        if (requestType == "GRAVEYARD")
+        {
+            std::pair<std::string, std::string> const idSplit = SplitOnce(request.second, kFieldSeparator);
+
+            RunGraveyardCommand(player, replyType, idSplit.first, idSplit.second);
             return true;
         }
 
