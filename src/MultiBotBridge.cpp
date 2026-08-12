@@ -4556,6 +4556,11 @@ bool IsAllowedFormationName(std::string const& formation)
         "line",
         "circle",
         "chaos",
+        // Local addition: mod-playerbots' FormationValue::Load accepts "far" as a
+        // ninth formation (follows at AiPlayerbot.FarDistance, 20y by default,
+        // instead of the 1.5y the other follow formations use). Upstream's list
+        // omits it, so without this the Far button would be rejected server-side.
+        "far",
         "shield"
     };
 
